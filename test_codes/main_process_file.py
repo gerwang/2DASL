@@ -17,6 +17,7 @@ import csv
 from params import *
 from filter import OneEuroFilter
 import json
+import torch.jit
 
 
 def convert_param_to_ori(pose, roi_box, img_ori):
@@ -100,8 +101,10 @@ def init_model():
     checkpoint = torch.load(checkpoint_fp, map_location=map_location)['res_state_dict']
     torch.cuda.set_device(device_ids[0])
     model = resnet50(pretrained=False, num_classes=num_classes)
-    model = nn.DataParallel(model, device_ids=device_ids).cuda()
+    model = nn.DataParallel(model, device_ids=device_ids)
     model.load_state_dict(checkpoint)
+    model = model.module.cuda()
+    model = torch.jit.script(model)
 
     cudnn.benchmark = True
     model.eval()
