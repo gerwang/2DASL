@@ -9,7 +9,7 @@ import torch.backends.cudnn as cudnn
 import time, os
 import numpy as np
 import matplotlib.pyplot as plt
-os.environ['CUDA_VISIBLE_DEVICES']='1'
+# os.environ['CUDA_VISIBLE_DEVICES']='1'
 
 #from benchmark_aflw1998 import calc_nme as calc_nme_alfw1998
 #from benchmark_aflw1998 import ana as ana_alfw1998
