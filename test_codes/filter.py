@@ -182,6 +182,10 @@ class LowPassFilter:
     self.prev_filtered_value = None
     self.alpha = alpha
 
+  def reset(self):
+    self.prev_raw_value = None
+    self.prev_filtered_value = None
+
   def process(self, value, alpha=None):
     """
     Filter the value.
@@ -241,6 +245,10 @@ class OneEuroFilter:
     edx = self.dx_filter.process(dx, self.compute_alpha(self.dcutoff))
     cutoff = self.mincutoff + self.beta * np.abs(edx)
     return self.x_filter.process(x, self.compute_alpha(cutoff))
+
+  def reset(self):
+      self.x_filter.reset()
+      self.dx_filter.reset()
 
 
 def hmap_to_uv(hmap):

@@ -1,23 +1,23 @@
 import argparse
-import cv2
+import csv
+import os
 
+import cv2
+import face_alignment
+import openmesh as om
+import torch
+import torch.jit
+import torch.nn as nn
+from torch.backends import cudnn
+
+import params
 from benchmark_0resnet50_4chls_FAN2d_18pts_1998 import obtain_18pts_map
 from ddfa_utils import reconstruct_vertex
 from ddfa_utils_inference import parse_roi_box_from_landmark, crop_img
-import params
-import torch
-import torch.nn as nn
-import face_alignment
-from resnet_xgtu_4chls import resnet50
-from torch.backends import cudnn
-import numpy as np
-import openmesh as om
-import os
-import csv
-from params import *
 from filter import OneEuroFilter
-import json
-import torch.jit
+from params import *
+from resnet_xgtu_4chls import resnet50
+import sys
 
 
 def convert_param_to_ori(pose, roi_box, img_ori):
@@ -33,9 +33,33 @@ def convert_param_to_ori(pose, roi_box, img_ori):
     return pose
 
 
+# total_time = 0
+# total_cnt = 0
+
+
 def process_one_image(fa, model, img_ori):
     # img is RGB image
-    preds = fa.get_landmarks(img_ori)  # (2, 68)
+    # start_time = time()
+    detected_faces = fa.face_detector.detect_from_image(img_ori[::4, ::4, ::-1].copy())
+    for face in detected_faces:
+        for i in range(4):
+            face[i] *= 4
+    # img_render = img_ori.copy()
+    # for face in detected_faces:
+    #     cv2.rectangle(img_render, (int(face[0]), int(face[1])), (int(face[2]), int(face[3])), [0, 255, 0], -1)
+    # cv2.imshow('frame', img_render)
+    # cv2.waitKey(0)
+    preds = fa.get_landmarks(img_ori, detected_faces=detected_faces)  # (2, 68)
+    # end_time = time()
+    # time_elapsed = end_time - start_time
+    # print('landmark: {}'.format(time_elapsed))
+    # global total_cnt, total_time
+    # total_time += time_elapsed
+    # total_cnt += 1
+    # if total_cnt == 100:
+    #     for i in range(10):
+    #         print('average time:', total_time / total_cnt)
+    # start_time = end_time
 
     '''
     for i in range(68):
@@ -45,7 +69,7 @@ def process_one_image(fa, model, img_ori):
     cv2.waitKey(0)
     '''
     if preds is None:
-        return np.array([])
+        return np.array([]), np.array([])
     inputs = []
     roi_boxes = []
     for pred in preds:
@@ -84,15 +108,37 @@ def process_one_image(fa, model, img_ori):
     with torch.no_grad():
         output = model(inputs)
     param_prediction = output.cpu().numpy()
-    param_prediction = param_prediction * param_std + param_mean
-    for i in range(param_prediction.shape[0]):
-        param_prediction[i, :12] = convert_param_to_ori(param_prediction[i, :12], roi_boxes[i], img_ori)
     # param_prediction[i, :12] = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]
-    return param_prediction
+    # print('resnet: {}'.format(time() - start_time))
+    return param_prediction, roi_boxes
+
+
+class TupleWrapper(nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, x):
+        return tuple(self.module(x))
+
+
+class ListWrapper(nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, x):
+        return list(self.module(x))
 
 
 def init_model():
-    fa = face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, flip_input=False)
+    fa = face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, flip_input=False, face_detector='sfd')
+    fa.face_alignment_net = ListWrapper(torch.jit.trace_module(TupleWrapper(fa.face_alignment_net), {
+        'forward': torch.randn(1, 3, 256, 256, dtype=torch.float32, device=torch.device('cuda:0'))
+    }))
+    fa.face_detector.face_detector = ListWrapper(torch.jit.trace_module(TupleWrapper(fa.face_detector.face_detector), {
+        'forward': torch.randn(1, 3, 120, 160, dtype=torch.float32, device=torch.device('cuda:0'))
+    }))
 
     device_ids = [0]
     checkpoint_fp = '../models/2DASL_checkpoint_epoch_allParams_stage2.pth.tar'
@@ -148,18 +194,36 @@ def main(args):
         cap = cv2.VideoCapture(0)
         frame_idx = 0
         filters = []
+        prev_track_success = False
         while cap.isOpened():
+
+            # start_time = time()
+
             ret, img_ori = cap.read()
+
+            # end_time = time()
+            # print('read image: {}'.format(end_time - start_time))
+            # start_time = end_time
+
             if not ret:
                 break
             img_ori = cv2.cvtColor(img_ori, cv2.COLOR_BGR2RGB)
-            param_prediction = process_one_image(fa, model, img_ori)  # only process one face currently
+            param_prediction, roi_boxes = process_one_image(fa, model, img_ori)  # only process one face currently
             if param_prediction.shape[0] < 1:
+                prev_track_success = False
+                if len(filters) != 0:
+                    for filter in filters:
+                        filter.reset()
                 continue
             if len(filters) == 0:
-                filters = [OneEuroFilter() for _ in range(param_prediction.shape[1])]
-            for i in range(len(filters)):
-                param_prediction[0][i] = filters[i].process(param_prediction[0][i])
+                filters = [OneEuroFilter(mincutoff=3.0) for _ in range(param_prediction.shape[1])]
+            if prev_track_success:
+                for i in range(len(filters)):
+                    param_prediction[0][i] = filters[i].process(param_prediction[0][i])
+            prev_track_success = True
+            param_prediction = param_prediction * param_std + param_mean
+            for i in range(param_prediction.shape[0]):
+                param_prediction[i, :12] = convert_param_to_ori(param_prediction[i, :12], roi_boxes[i], img_ori)
             '''
             cv2.imshow('{}'.format(frame_idx), img_rendered)
             img_crop = render_img(img_crop, param_prediction)
@@ -167,12 +231,14 @@ def main(args):
             cv2.waitKey(0)
             cv2.destroyAllWindows()
             '''
-            print(json.dumps(param_prediction.tolist()))
+            print(','.join(map(str, param_prediction.flatten())))
+            sys.stdout.flush()
             if args.write_csv:
                 for i in range(param_prediction.shape[0]):
                     output_name = '{}_{}'.format(frame_idx, i)
                     csv_writer.writerow([output_name] + param_prediction[i].tolist())
             frame_idx += 1
+            # print('predict time: {}'.format(time() - start_time))
     elif args.mode == 'video':
         cap = cv2.VideoCapture(args.input)
         frame_idx = 0
