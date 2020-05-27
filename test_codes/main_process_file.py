@@ -18,6 +18,8 @@ from filter import OneEuroFilter
 from params import *
 from resnet_xgtu_4chls import resnet50
 import sys
+from time import time, sleep
+from landmark_sensetime.landmark_detector import LandmarkDetector
 
 
 def convert_param_to_ori(pose, roi_box, img_ori):
@@ -36,30 +38,40 @@ def convert_param_to_ori(pose, roi_box, img_ori):
 # total_time = 0
 # total_cnt = 0
 
+use_sensetime = True
+
+map_106_to_68_index = list(range(0, 33, 2)) + \
+                      list(range(33, 38)) + \
+                      list(range(38, 43)) + \
+                      list(range(43, 47)) + \
+                      list(range(47, 52)) + \
+                      list(range(52, 58)) + \
+                      list(range(58, 64)) + \
+                      list(range(84, 96)) + \
+                      list(range(96, 104))
+
+
+def convert_106_to_68(x):
+    return x[map_106_to_68_index]
+
 
 def process_one_image(fa, model, img_ori):
     # img is RGB image
-    # start_time = time()
-    detected_faces = fa.face_detector.detect_from_image(img_ori[::4, ::4, ::-1].copy())
-    for face in detected_faces:
-        for i in range(4):
-            face[i] *= 4
-    # img_render = img_ori.copy()
-    # for face in detected_faces:
-    #     cv2.rectangle(img_render, (int(face[0]), int(face[1])), (int(face[2]), int(face[3])), [0, 255, 0], -1)
-    # cv2.imshow('frame', img_render)
-    # cv2.waitKey(0)
-    preds = fa.get_landmarks(img_ori, detected_faces=detected_faces)  # (2, 68)
-    # end_time = time()
-    # time_elapsed = end_time - start_time
-    # print('landmark: {}'.format(time_elapsed))
-    # global total_cnt, total_time
-    # total_time += time_elapsed
-    # total_cnt += 1
-    # if total_cnt == 100:
-    #     for i in range(10):
-    #         print('average time:', total_time / total_cnt)
-    # start_time = end_time
+    if use_sensetime:
+        img_bgr = cv2.cvtColor(img_ori, cv2.COLOR_RGB2BGR)
+        res = fa.detect_landmarks(img_bgr)
+        if not res['lmk_success']:
+            print('Warning: No faces were detected.')
+            preds = None
+        else:
+            preds = [convert_106_to_68(res['landmarks'])]
+        sleep(0.02)
+    else:
+        detected_faces = fa.face_detector.detect_from_image(img_ori[::8, ::8, ::-1].copy())
+        for face in detected_faces:
+            for i in range(4):
+                face[i] *= 8
+        preds = fa.get_landmarks(img_ori, detected_faces=detected_faces)  # (2, 68)
 
     '''
     for i in range(68):
@@ -73,6 +85,21 @@ def process_one_image(fa, model, img_ori):
     inputs = []
     roi_boxes = []
     for pred in preds:
+        # img_render = cv2.cvtColor(img_ori, cv2.COLOR_RGB2BGR)
+        # img_render = cv2.resize(img_render, (img_render.shape[1] * 2, img_render.shape[0] * 2))
+        # font = cv2.FONT_HERSHEY_SIMPLEX
+        # fontScale = 0.6
+        # fontColor = (0, 255, 0)
+        # lineType = 2
+        # for k in range(pred.shape[0]):
+        #     cv2.circle(img_render, (int(pred[k, 0]) * 2, int(pred[k, 1]) * 2), 2, (0, 0, 255), -1)
+        #     cv2.putText(img_render, str(k), (int(pred[k, 0]) * 2, int(pred[k, 1]) * 2), font,
+        #                 fontScale,
+        #                 fontColor,
+        #                 lineType)
+        # cv2.imshow('frame', img_render)
+        # cv2.waitKey(0)
+
         pred = pred.T
         roi_box = parse_roi_box_from_landmark(pred)
         img = crop_img(img_ori, roi_box)
@@ -132,25 +159,32 @@ class ListWrapper(nn.Module):
 
 
 def init_model():
-    fa = face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, flip_input=False, face_detector='sfd')
-    fa.face_alignment_net = ListWrapper(torch.jit.trace_module(TupleWrapper(fa.face_alignment_net), {
-        'forward': torch.randn(1, 3, 256, 256, dtype=torch.float32, device=torch.device('cuda:0'))
-    }))
-    fa.face_detector.face_detector = ListWrapper(torch.jit.trace_module(TupleWrapper(fa.face_detector.face_detector), {
-        'forward': torch.randn(1, 3, 120, 160, dtype=torch.float32, device=torch.device('cuda:0'))
-    }))
+    with torch.jit.optimized_execution(True):
+        if use_sensetime:
+            fa = LandmarkDetector()
+        else:
+            fa = face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, flip_input=False, face_detector='sfd')
+            fa.face_alignment_net = ListWrapper(torch.jit.trace_module(TupleWrapper(fa.face_alignment_net), {
+                'forward': torch.randn(1, 3, 256, 256, dtype=torch.float32, device=torch.device('cuda:0'))
+            }))
+            fa.face_detector.face_detector = ListWrapper(
+                torch.jit.trace_module(TupleWrapper(fa.face_detector.face_detector), {
+                    'forward': torch.randn(1, 3, 60, 80, dtype=torch.float32, device=torch.device('cuda:0'))
+                }))
 
-    device_ids = [0]
-    checkpoint_fp = '../models/2DASL_checkpoint_epoch_allParams_stage2.pth.tar'
-    num_classes = 62
-    map_location = {f'cuda:{i}': 'cuda:0' for i in range(8)}
-    checkpoint = torch.load(checkpoint_fp, map_location=map_location)['res_state_dict']
-    torch.cuda.set_device(device_ids[0])
-    model = resnet50(pretrained=False, num_classes=num_classes)
-    model = nn.DataParallel(model, device_ids=device_ids)
-    model.load_state_dict(checkpoint)
-    model = model.module.cuda()
-    model = torch.jit.script(model)
+        device_ids = [0]
+        checkpoint_fp = '../models/2DASL_checkpoint_epoch_allParams_stage2.pth.tar'
+        num_classes = 62
+        map_location = {f'cuda:{i}': 'cuda:0' for i in range(8)}
+        checkpoint = torch.load(checkpoint_fp, map_location=map_location)['res_state_dict']
+        torch.cuda.set_device(device_ids[0])
+        model = resnet50(pretrained=False, num_classes=num_classes)
+        model = nn.DataParallel(model, device_ids=device_ids)
+        model.load_state_dict(checkpoint)
+        model = model.module.cuda()
+        model = torch.jit.script(model)
+        # model = torch.jit.trace_module(model, {
+        #     'forward': torch.randn(1, 4, 120, 120, dtype=torch.float32, device=torch.device('cuda:0'))})
 
     cudnn.benchmark = True
     model.eval()
@@ -216,7 +250,7 @@ def main(args):
                         filter.reset()
                 continue
             if len(filters) == 0:
-                filters = [OneEuroFilter(mincutoff=3.0) for _ in range(param_prediction.shape[1])]
+                filters = [OneEuroFilter(mincutoff=10.0) for _ in range(param_prediction.shape[1])]
             if prev_track_success:
                 for i in range(len(filters)):
                     param_prediction[0][i] = filters[i].process(param_prediction[0][i])
